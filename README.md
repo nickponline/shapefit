@@ -23,6 +23,8 @@ polygon = fitter.fit(mask)          # (N, 2) array of (x, y) vertices
 
 ![pipeline](docs/images/pipeline.png)
 
+For a step-by-step walk-through with diagrams and a glossary, see **[docs/explainer.html](docs/explainer.html)**.
+
 > [!IMPORTANT]
 > **Status:** the data pipeline, model, vectoriser, API and training script
 > are complete and tested. The only checkpoint shipped,
