@@ -2,6 +2,8 @@
 
 **Fit clean polygons to irregular shapes with a neural network.**
 
+📖 **[Read the illustrated explainer](https://claude.ai/artifact/TQyf1TVKUrR8SDPAA9RXfq)**: how it works step by step, with diagrams and a glossary (also in [`docs/explainer.html`](docs/explainer.html)).
+
 Segmentation masks, scanned drawings, hand-traced regions and noisy GIS
 footprints all describe shapes that are *meant* to be polygons. What you get
 instead has bumps, jagged edges, notches, gaps, holes and rounded corners.
@@ -22,8 +24,6 @@ polygon = fitter.fit(mask)          # (N, 2) array of (x, y) vertices
 ```
 
 ![pipeline](docs/images/pipeline.png)
-
-For a step-by-step walk-through with diagrams and a glossary, see **[docs/explainer.html](docs/explainer.html)**.
 
 > [!IMPORTANT]
 > **Status:** the data pipeline, model, vectoriser, API and training script
