@@ -4,40 +4,43 @@
 
 📖 **[Read the illustrated explainer](https://claude.ai/artifact/TQyf1TVKUrR8SDPAA9RXfq)**: how it works step by step, with diagrams and a glossary (also in [`docs/explainer.html`](docs/explainer.html)).
 
-Segmentation masks, scanned drawings, hand-traced regions and noisy GIS
-footprints all describe shapes that are *meant* to be polygons. What you get
-instead has bumps, jagged edges, notches, gaps, holes and rounded corners.
-Classical simplification (`cv2.approxPolyDP`, Douglas–Peucker, convex hulls)
-only *removes* points. It can't tell a bump from a corner, so it either keeps
-the noise or cuts the corners off.
+Many shapes must be polygons. Examples are building outlines from aerial
+photos, rooms in scanned floor plans, and parts in drawings. But the data
+often shows these shapes with bad edges: bumps, jagged steps, gaps, holes and
+rounded corners.
 
-`shapefit` *learns* the inverse of the corruption instead. The idea is simple:
-clean polygons are trivial to generate, and so are the ways real shapes get
-damaged. That gives unlimited `(irregular shape → clean polygon)` training pairs
-for free.
+The usual tool is Douglas–Peucker simplification (`cv2.approxPolyDP`). It can
+only remove points from the outline. It cannot tell a bump from a corner. Thus
+it keeps the bumps, or it cuts off the real corners.
+
+shapefit uses a different method. It is easy to make a clean polygon and then
+damage it. This gives an unlimited number of training pairs: a damaged shape
+and its correct clean polygon. A neural network learns from these pairs to
+remove the damage.
 
 ```python
 from shapefit import ShapeFitter
 
 fitter = ShapeFitter("shapefit/weights/shapefit.pt")
-polygon = fitter.fit(mask)          # (N, 2) array of (x, y) vertices
+polygon = fitter.fit(mask)          # (N, 2) array of (x, y) corners
 ```
 
 ![pipeline](docs/images/pipeline.png)
 
 > [!IMPORTANT]
-> **Status:** the data pipeline, model, vectoriser, API and training script
-> are complete and tested. The only checkpoint shipped,
-> `shapefit/weights/overfit_demo.pt`, was deliberately **overfit on 48 scenes**
-> to show the whole pipeline working end to end. It memorises those shapes and
-> does *not* generalise. The figures and the first table below use those 48
-> scenes. A general model needs one full training run, which is a single
-> command; see [Training](#training).
+> **Status.** The data generator, network, vectoriser, API and training script
+> are complete and tested. The full training run is not done yet. The only
+> checkpoint in the package is `shapefit/weights/overfit_demo.pt`. We trained
+> it on only 48 shapes, to show that all parts work together. It learned those
+> 48 shapes by memory (this is **overfitting**). It does *not* work on new
+> shapes. The figures and the first table below use those 48 shapes. To make a
+> general model, do the full training run (see [Training](#training)).
 
 ---
 
 ## Contents
 
+- [Terms](#terms)
 - [How it works](#how-it-works)
 - [Installation](#installation)
 - [Usage](#usage)
@@ -45,55 +48,74 @@ polygon = fitter.fit(mask)          # (N, 2) array of (x, y) vertices
 - [Training data](#training-data)
 - [Training](#training)
 - [Library layout](#library-layout)
-- [Limitations and next steps](#limitations-and-next-steps)
+- [Limits and next steps](#limits-and-next-steps)
+
+## Terms
+
+Each term has one meaning in this document. The
+[explainer](docs/explainer.html#glossary) has a full glossary.
+
+| Term | Meaning |
+|---|---|
+| **mask** | An image where each pixel is 1 (inside the shape) or 0 (outside the shape). |
+| **corner** | A point where two edges of a polygon meet. The code calls it a *vertex*. |
+| **canvas** | The fixed 128 × 128 image that the network always uses. |
+| **heatmap** | An image where a high pixel value means "a corner is probably here". |
+| **contour** | The outer edge of a mask, as a closed chain of points in order. |
+| **vectoriser** | The part of shapefit that changes the network output images into a list of corners. |
+| **checkpoint** | A file that contains the trained network weights. |
+| **IoU** | Overlap area of two shapes divided by the area that either shape covers. 1.0 means identical. |
+| **overfitting** | A network learns its training examples by memory and does not work on new examples. |
 
 ## How it works
 
 ```
- any-resolution mask      canonical canvas          U-Net (7.8M)               vectoriser                 polygon
- or noisy vertex list ──▶ 128×128, bbox at 72% ──▶ ├─ clean-mask logits ──▶ contour (4× upsampled) ──┐
-                          (frame.py)              └─ vertex heatmap     ──▶ peaks → snap to contour ─┤
-                                                                            order by arclength        │
-                                                                            TLS line per edge  ◀──────┘
-                                                                            intersect neighbours
-                                                                            (optional angle snapping) ──▶ map back to input coords
+ mask of any size,       canvas                    U-Net (7.8 M weights)       vectoriser                  polygon
+ or noisy point list ──▶ 128×128, box at 72 % ──▶ ├─ clean mask      ──▶ contour (4× larger) ───────┐
+                         (frame.py)               └─ corner heatmap  ──▶ peaks → put on contour ────┤
+                                                                           sort by position          │
+                                                                           fit one line per edge ◀───┘
+                                                                           intersect the lines
+                                                                           (optional angle rule) ──▶ move back to input coordinates
 ```
 
-1. **Canonical framing.** The input (a binary mask of any size, an `(N, 2)`
-   vertex list, or a shapely `Polygon`) is cropped to its bounding box, then
-   scaled so the long side covers 72 % of a 128×128 canvas. Tiny distractor
-   specks are ignored when computing the frame. Training samples are framed the
-   same way, from the *corrupted* outline.
-2. **Two-headed U-Net.** It sees the mask plus two CoordConv channels and
-   predicts:
-   - the **clean mask** (BCE + Dice), which says *where the boundary really is*
-   - a **vertex heatmap** (CenterNet focal loss), which says *where the corners are*
-3. **Vectorisation, with no learned ordering.** Heatmap peaks are snapped to
-   the contour of the predicted clean mask. Sorting them by arclength gives the
-   vertex order for free, so the network never has to output a variable-length
-   sequence. Each edge is then refit with a total-least-squares line through the
-   contour points between its two corners (ignoring 15 % at each end).
-   Neighbouring lines are intersected. The corners come out *sharp* and
-   sub-pixel accurate, even though the heatmap peaks are blurry.
-4. **Optional regularisation.** `regularize="orthogonal"` snaps edges to a
-   dominant direction or its perpendicular, for buildings and rooms.
-   `regularize="parallel"` makes near-parallel edges exactly parallel.
+1. **Framing.** shapefit finds the bounding box of the input. The input can be
+   a mask of any size, an `(N, 2)` list of points, or a shapely `Polygon`.
+   shapefit scales the shape so that the longest side of the box is 72 % of a
+   128 × 128 canvas. It ignores very small dots. The training data uses the
+   same framing.
+2. **The network.** A U-Net looks at the canvas. It makes two images:
+   - a **clean mask**, which shows where the true edge is;
+   - a **corner heatmap**, which shows where the corners are.
+3. **The vectoriser.** This step uses geometry, not learning.
+   1. Find the contour of the clean mask.
+   2. Find the peaks of the heatmap. Move each peak onto the contour.
+   3. Sort the corners by their position along the contour. This gives the
+      correct order around the shape.
+   4. For each edge, fit a straight line through the contour points between its
+      two corners. Ignore 15 % of the points at each end.
+   5. Each corner is the point where the lines of its two edges cross. The
+      result is a sharp corner, with an accuracy better than one pixel.
+4. **Regularisation (optional).** `regularize="orthogonal"` makes all corners
+   90°. Use it for buildings and rooms. `regularize="parallel"` makes edges that
+   are almost parallel exactly parallel.
 
-**Why this design?** Predicting vertices directly (set prediction or
-autoregressive) has to cope with a variable vertex count and a cyclic,
-start-point-free ordering, and it needs far more data and compute. A dense
-mask plus heatmap prediction is translation-equivariant, easy to train, and
-turns ordering into a 1-D sort. The vectoriser is also a clean upper bound:
-fed *perfect* network outputs it reaches **IoU 0.994** with the **exact vertex
-count on 100 %** of samples (`tests/test_vectorize.py`). Any remaining error is
-the network's.
+**Why two images and not a list of corners?** A list has a different length
+for each shape, and it has no fixed start point. These facts make a list
+difficult to learn. Two images are easier to learn. The sort in step 3 then
+gives the order.
+
+**Upper limit.** We gave the vectoriser perfect network outputs. It then gets
+**IoU 0.994** and the **correct number of corners on 100 %** of shapes
+(`tests/test_vectorize.py`). Thus nearly all remaining error comes from the
+network.
 
 ## Installation
 
 ```bash
 git clone <this repo> shape-fit && cd shape-fit
 pip install -e ".[dev]"      # numpy, torch, opencv-python-headless, shapely, scipy (+ pytest, matplotlib)
-pytest                       # 25 tests, ~10 s on CPU
+pytest                       # 25 tests, approximately 10 s on CPU
 ```
 
 ## Usage
@@ -104,35 +126,39 @@ from shapefit import ShapeFitter, fit_polygon, iou
 
 fitter = ShapeFitter("path/to/checkpoint.pt", device="cpu")   # or "cuda" / "mps"
 
-# 1. a binary mask of any size (uint8, bool, or float in [0, 1]; RGB(A) is OK too)
-poly = fitter.fit(mask)                       # -> (N, 2) float array, (x, y) = (col, row)
+# 1. a mask of any size (uint8, bool, or float from 0 to 1; RGB and RGBA are also accepted)
+poly = fitter.fit(mask)                       # -> (N, 2) float array, (x, y) = (column, row)
 
-# 2. a noisy outline as a vertex list, or a shapely Polygon
+# 2. a noisy outline as a list of points, or a shapely Polygon
 poly = fitter.fit(noisy_points)               # (M, 2) array, any units
 poly = fitter.fit(shapely_polygon)
 
-# 3. regularisation for man-made shapes
-poly = fitter.fit(mask, regularize="orthogonal")   # all edges at 0° / 90° to a dominant axis
-poly = fitter.fit(mask, regularize="parallel")     # near-parallel edges made exactly parallel
+# 3. regularisation for shapes made by people
+poly = fitter.fit(mask, regularize="orthogonal")   # all corners 90°
+poly = fitter.fit(mask, regularize="parallel")     # almost-parallel edges become parallel
 
-# 4. test-time augmentation (average of 8 flips/rotations), slower but more robust
+# 4. test-time augmentation: the mean of 8 rotated and flipped copies (slower)
 poly = fitter.fit(mask, tta=True)
 
-# 5. the intermediate outputs, for debugging and visualisation
+# 5. the intermediate outputs, to find problems or to make figures
 r = fitter.fit_detailed(mask)
 r.canvas, r.clean_mask, r.vertex_heatmap, r.canvas_polygon, r.frame
 
-# one-shot helper; loads shapefit/weights/shapefit.pt once and caches it
+# short form: loads shapefit/weights/shapefit.pt one time and keeps it
 poly = fit_polygon(mask)
 ```
 
-Vertices are returned counter-clockwise as displayed on screen (x right,
-y down), in the input's own pixel coordinates; pixel centres are at integers.
-Tuning knobs passed through `fit(...)`: `peak_threshold` (default 0.25; lower
-it to recover faint corners) and `min_turn_deg` (default 8°; vertices that turn
-less than this are merged).
+The output corners are in the input pixel coordinates. Pixel centres are at
+whole numbers. The corners go counter-clockwise as you see them on the screen
+(x to the right, y down).
 
-A runnable version is in [`examples/quickstart.py`](examples/quickstart.py):
+You can adjust two values in `fit(...)`:
+
+- `peak_threshold` (default 0.25). Make it lower to find weak corners.
+- `min_turn_deg` (default 8°). shapefit removes a corner if the direction
+  changes by less than this angle.
+
+[`examples/quickstart.py`](examples/quickstart.py) is a complete example:
 
 ```
 $ python examples/quickstart.py
@@ -148,21 +174,31 @@ canvas (128, 128) | input->canvas scale 0.333
 
 ## Results (overfit demo)
 
-The demo checkpoint was trained on the 48 scenes `scene_set(48, seed=7)`.
-These are 480×360 masks with one corrupted shape each, at a random position
-and scale, passed through the *same* public `fit()` path you'd use. Green is
-`shapefit`. Dashed orange is `cv2.approxPolyDP` at 2 % of the perimeter, the
-usual default.
+We trained the demo checkpoint on 48 shapes: `scene_set(48, seed=7)`. Each
+shape is in a 480 × 360 mask, at a random position and size. The shapes go
+through the same public `fit()` function that you use.
+
+In the figure, the green line is shapefit. The orange dashed line is
+`cv2.approxPolyDP` with ε = 2 % of the perimeter, which is a usual setting.
 
 ![results](docs/images/results.png)
 
-Regularisation on a memorised rectilinear scene:
+Regularisation on one of the 48 shapes:
 
 ![regularize](docs/images/regularize.png)
 
-Metrics on the memorised scenes: IoU against the ground-truth polygon,
-exact-vertex-count rate, vertex F1 (Hungarian-matched within 3 % of the size),
-and median vertex error and Hausdorff distance, both as a fraction of the size.
+The table compares each method with the true polygon. It uses five metrics:
+
+- **IoU**: the overlap of the output and the true polygon.
+- **Vertex count exact**: the percent of shapes with the correct number of corners.
+- **Vertex F1**: a score for missed and extra corners. A corner is correct if
+  it is within 3 % of the shape size from a true corner.
+- **Vertex error**: the median distance from each corner to its true corner,
+  as a percent of the shape size.
+- **Hausdorff**: the largest distance between the two outlines, as a percent
+  of the shape size.
+
+**The 48 memorised shapes:**
 
 | method | IoU ↑ | vertex count exact ↑ | vertex F1 @3% ↑ | vertex err ↓ | Hausdorff ↓ |
 |---|---|---|---|---|---|
@@ -174,18 +210,17 @@ and median vertex error and Hausdorff distance, both as a fraction of the size.
 | convex hull + DP | 0.906 | 25.0% | 0.582 | 2.50% | 5.04% |
 | min-area rectangle | 0.747 | 43.8% | 0.216 | 11.71% | 20.53% |
 
-The TTA row is lower *on purpose*. Seven of the eight flipped or rotated views
-are inputs the overfit model has never seen, so averaging them hurts. TTA is
-meant for a generally trained model (`tests/test_api.py` checks that the
-transforms are undone exactly).
+The TTA row is worse, and this is expected. TTA shows the network 8 rotated
+and flipped copies of each shape. The overfit network learned each shape in
+one orientation only. Thus 7 of the 8 copies are new to it. TTA is for a model
+after full training. A test (`tests/test_api.py`) confirms that TTA reverses
+each rotation and flip correctly.
 
-The overfit run hits the vectoriser's oracle ceiling (IoU 0.994, exact
-vertex count on 100 % of scenes) at the first evaluation, step 500, which takes
-about 2 minutes on an M3 Max. That's the sanity check that the data, targets,
-framing and vectoriser all agree.
+The overfit run gets IoU 0.994 and 100 % correct corner counts at its first
+check (step 500). This takes approximately 2 minutes on an M3 Max. This result
+shows that the data, the targets, the framing and the vectoriser agree.
 
-**And, for honesty, the same overfit model on 200 scenes it has never seen**
-(`scene_set(200, seed=999)`):
+**200 new shapes, not in the training set** (`scene_set(200, seed=999)`):
 
 | method | IoU ↑ | vertex count exact ↑ | vertex F1 @3% ↑ | vertex err ↓ | Hausdorff ↓ |
 |---|---|---|---|---|---|
@@ -197,89 +232,112 @@ framing and vectoriser all agree.
 | convex hull + DP | 0.888 | 29.0% | 0.583 | 2.82% | 5.78% |
 | min-area rectangle | 0.718 | 36.0% | 0.193 | 15.07% | 23.60% |
 
-As expected, memorising 48 shapes doesn't produce a general shape model. The
-predicted clean mask still beats every baseline on IoU, but the vertex heatmap
-hasn't learned what a corner is, so the vertex count is almost never right.
-Closing this gap is exactly what the full training run (millions of fresh
-samples instead of 48) is for.
+The overfit model does not work on new shapes. Its IoU is still better than
+the other methods. But it does not find the corners correctly: the number of
+corners is correct for only 0.5 % of shapes. The full training run uses
+millions of new shapes, not 48. It is necessary to correct this.
+
+> [!CAUTION]
+> Do not use `overfit_demo.pt` on your own data. Do the full training run first.
 
 ## Training data
 
-Full details are in **[docs/DATA.md](docs/DATA.md)**. The short version:
+[docs/DATA.md](docs/DATA.md) gives all the details. In short:
 
-* **6 polygon families:** regular n-gons, rotated rectangles, quads
-  (trapezoids, parallelograms, kites), random convex, concave star-shaped, and
-  rectilinear building-like L/T/U/+ shapes. All are filtered so that every
-  vertex is a real corner: turn ≥ 12°, edges ≥ 6 % of the size, no slivers.
-* **15 named corruptions.** Geometric ones displace a dense outline along its
-  normal: jagged, bumps/dents, wobble, staircase, rounded corners. Raster ones
-  act on the mask: bites, edge gaps, attached blobs, cuts, holes, speckle,
-  distractor specks, pixelation, blur-threshold, morphology. A per-sample
-  severity scales them all.
+* **6 types of polygon:** regular polygons, rotated rectangles, quads
+  (trapezoids, parallelograms, kites), random convex shapes, star shapes, and
+  L, T, U and + shapes that look like buildings. Each corner must turn by 12° or
+  more. Each edge must be 6 % of the shape size or longer. Very thin shapes are
+  rejected.
+* **15 types of damage.** Geometric damage moves the outline in or out: jagged
+  edges, bumps and dents, wobble, steps and rounded corners. Pixel damage
+  changes the mask directly: bites, gaps, blobs, cuts, holes, speckle, loose
+  dots, pixelation, blur and morphology. A random value called *severity*
+  controls how strong the damage is.
 
 ![corruptions](docs/images/corruptions.png)
 
-Training pairs: input, clean target with polygon, and vertex heatmap target:
+Training pairs. Row 1 is the input. Row 2 is the clean target with the true
+polygon. Row 3 is the target heatmap.
 
 ![dataset](docs/images/dataset.png)
 
 ## Training
 
 ```bash
-# the full run: infinite on-the-fly synthetic data (recommended)
+# the full run, with new data for each step (recommended)
 python -m shapefit.train --steps 30000 --batch 64 --out runs/base
 cp runs/base/best.pt shapefit/weights/shapefit.pt
 
-# or pre-generate a fixed, shareable dataset (bit-packed .npz shards, ~80 MB per 200k samples)
+# or: write a fixed dataset to disk first (approximately 80 MB for 200,000 shapes)
 python -m shapefit.make_dataset --n 200000 --out data/train
 python -m shapefit.train --data data/train --steps 30000 --out runs/shards
 
-# reproduce the demo checkpoint (about 10 min on an M3 Max), then shrink it to fp16
+# make the demo checkpoint again (approximately 10 min on an M3 Max), then make the file smaller (fp16)
 python -m shapefit.train --overfit 48 --batch 32 --steps 2500 --eval-every 500 --out runs/overfit
 python examples/export_weights.py runs/overfit/best.pt shapefit/weights/overfit_demo.pt
 
-# regenerate every figure and table in this README
+# make all figures and tables in this README again
 python examples/make_readme_figures.py --weights shapefit/weights/overfit_demo.pt
 ```
 
-The trainer picks CUDA, then MPS, then CPU. It logs the validation metrics
-above to `runs/*/log.jsonl` and keeps `best.pt` and `last.pt`. Expect about
-0.4 s/step at batch 64 on an M3 Max, so roughly 3.5 h for 30k steps; a CUDA GPU
-is several times faster.
+The training script uses a CUDA GPU if there is one. If not, it uses the
+Apple GPU (MPS). If neither is available, it uses the CPU.
+
+Every 2,000 steps, the script measures the five metrics on 500 test shapes. It
+writes them to `runs/*/log.jsonl`. It keeps the best checkpoint (`best.pt`) and
+the last checkpoint (`last.pt`).
+
+We measured the time of the full run on an Apple M3 Max:
+
+| Item | Time |
+|---|---|
+| One training step (64 shapes) | 386 ms |
+| Of that, the wait for data | 0.4 ms |
+| One check on 500 test shapes | 1.6 s |
+| **30,000 steps** | **approximately 3.2 h** |
+
+The GPU sets the speed. More data workers do not make training faster. A CUDA
+GPU is several times faster.
+
+> [!CAUTION]
+> The training script cannot continue a stopped run yet. It saves `last.pt`
+> every 2,000 steps, but after a crash you must start again.
 
 ## Library layout
 
 | module | contents |
 |---|---|
-| `shapefit/shapes.py` | clean polygon families and validity rules |
-| `shapefit/degrade.py` | the `GEOMETRIC` and `RASTER` corruption registries |
-| `shapefit/data.py` | rendering, heatmaps, `make_sample`, `SyntheticShapes` stream |
-| `shapefit/scenes.py` | full-resolution test scenes run through the public API |
-| `shapefit/make_dataset.py` | shard writer and `ShardDataset` |
-| `shapefit/frame.py` | mapping any input to and from the 128×128 canvas |
-| `shapefit/model.py` | `ShapeFitNet` U-Net and its losses |
-| `shapefit/vectorize.py` | network outputs → polygon; angle regularisation |
+| `shapefit/shapes.py` | the polygon types and the rules for a valid polygon |
+| `shapefit/degrade.py` | the damage types (`GEOMETRIC` and `RASTER`) |
+| `shapefit/data.py` | drawing, heatmaps, `make_sample`, the `SyntheticShapes` data stream |
+| `shapefit/scenes.py` | full-size test images that use the public API |
+| `shapefit/make_dataset.py` | writes a fixed dataset to disk; `ShardDataset` reads it |
+| `shapefit/frame.py` | moves any input to the 128 × 128 canvas and back |
+| `shapefit/model.py` | the `ShapeFitNet` U-Net and its loss functions |
+| `shapefit/vectorize.py` | changes network outputs into a polygon; regularisation |
 | `shapefit/fit.py` | `ShapeFitter`, `fit_polygon`, `FitResult` |
-| `shapefit/metrics.py` | IoU, Hausdorff, Hungarian vertex matching |
-| `shapefit/baselines.py` | Douglas–Peucker, convex hull, min-area rectangle |
-| `shapefit/train.py` | training CLI (stream / shards / overfit) |
+| `shapefit/metrics.py` | IoU, Hausdorff distance, corner matching |
+| `shapefit/baselines.py` | Douglas–Peucker, convex hull, minimum-area rectangle |
+| `shapefit/train.py` | the training command (data stream, dataset on disk, or overfit) |
 
-## Limitations and next steps
+## Limits and next steps
 
-* **No general checkpoint yet.** Run the full training (above). The data,
-  loss and vectoriser are already validated by the overfit run and the oracle
-  tests.
-* **One outer ring per call.** Holes in the *target* polygon aren't modelled;
-  holes in the input are treated as noise. For several objects, split the mask
-  into connected components and call `fit` on each.
-* **Resolution:** corners are localised on a 128 px canvas, then refined to
-  sub-pixel accuracy by line fitting. For very large shapes with fine detail,
-  a 256 px variant (`ShapeFitNet` and `SIZE`) is a straightforward change.
-* **Curves aren't polygons.** Circles and ellipses get approximated by many
-  vertices, or by ambiguous ones.
-* Next ideas: a vertex-count/confidence output, curved-edge primitives (arcs),
-  a multi-ring version for polygons with holes, and real-data fine-tuning (for
-  example, building footprints from segmentation).
+* **No general checkpoint yet.** Do the full training run (see above). The
+  overfit run and the vectoriser tests already confirm the data, the losses and
+  the vectoriser.
+* **One outer edge for each call.** shapefit does not make polygons with
+  holes. It ignores holes in the input, as noise. For many shapes in one mask,
+  split the mask into connected components. Then call `fit` for each one.
+* **Resolution.** The network finds corners on a 128-pixel canvas. The line
+  fit then gives an accuracy better than one pixel. Very small details on a
+  very large shape can disappear. A 256-pixel version is a small change
+  (`ShapeFitNet` and `SIZE`).
+* **Curves are not polygons.** A circle or an ellipse gets many corners, or
+  corners that are not clear.
+* **Possible next work:** an output for the number of corners and for
+  confidence, edges that are arcs, polygons with holes, and more training on
+  real data (for example, building outlines).
 
 ## License
 
