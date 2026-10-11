@@ -85,6 +85,8 @@ def main(argv=None):
     ap.add_argument("--heat-weight", type=float, default=1.0)
     ap.add_argument("--eval-every", type=int, default=2000)
     ap.add_argument("--device", default=None)
+    ap.add_argument("--no-amp", action="store_true", help="disable bf16 autocast on CUDA")
+    ap.add_argument("--no-compile", action="store_true", help="disable torch.compile on CUDA")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="runs/base")
     ap.add_argument("--data", default=None, help="shard dir from make_dataset (default: on-the-fly)")
@@ -97,7 +99,11 @@ def main(argv=None):
     device = pick_device(args.device)
     torch.manual_seed(args.seed)
     model = ShapeFitNet(base=args.base).to(device)
-    print(f"device={device} params={sum(p.numel() for p in model.parameters())/1e6:.2f}M")
+    amp = device.type == "cuda" and not args.no_amp
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+    net = torch.compile(model) if device.type == "cuda" and not args.no_compile else model
+    print(f"device={device} amp={amp} params={sum(p.numel() for p in model.parameters())/1e6:.2f}M")
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     warm = 500
@@ -106,6 +112,7 @@ def main(argv=None):
         lambda s: min(1.0, (s + 1) / warm) * 0.5 * (1 + math.cos(math.pi * min(s, args.steps) / args.steps)),
     )
     val = fixed_set(500, seed=10_000)
+    val_union = [] if args.overfit else fixed_set(200, seed=10_001, family="rect_union")
     if args.overfit:
         # full-resolution scenes pushed through the public preprocessing, so the
         # memorised examples can be reproduced with ShapeFitter.fit(scene.image)
@@ -131,7 +138,9 @@ def main(argv=None):
     for step, (x, m, h) in enumerate(_cycle(loader), 1):
         # NB: no non_blocking copies (silently corrupts data on MPS)
         x, m, h = x.to(device), m.to(device), h.to(device)
-        logits = model(x)
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
+            logits = net(x)
+        logits = logits.float()
         lm = mask_loss(logits[:, :1], m)
         lh = focal_heatmap_loss(logits[:, 1:], h)
         loss = lm + args.heat_weight * lh
@@ -152,6 +161,8 @@ def main(argv=None):
             )
         if step % args.eval_every == 0 or step == args.steps:
             metrics = evaluate(model, val, device)
+            if val_union:
+                metrics.update({f"union_{k}": v for k, v in evaluate(model, val_union, device).items()})
             print(f"  eval @ {step}: " + " ".join(f"{k}={v:.4f}" for k, v in metrics.items()), flush=True)
             log.write(json.dumps({"step": step, **metrics}) + "\n")
             log.flush()

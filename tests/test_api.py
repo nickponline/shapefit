@@ -11,7 +11,7 @@ from shapefit.metrics import iou
 from shapefit.model import ShapeFitNet, focal_heatmap_loss, mask_loss
 from shapefit.scenes import scene_set
 
-DEMO = Path(__file__).parents[1] / "shapefit" / "weights" / "overfit_demo.pt"
+WEIGHTS = Path(__file__).parents[1] / "shapefit" / "weights" / "shapefit.pt"
 
 
 @pytest.fixture(scope="module")
@@ -68,14 +68,22 @@ def test_empty_mask_raises(random_ckpt):
         fit_polygon(np.zeros((50, 50), np.uint8), weights=random_ckpt)
 
 
-@pytest.mark.skipif(not DEMO.exists(), reason="demo weights not built")
-def test_overfit_demo_memorised_its_scenes():
-    """The demo checkpoint was overfit on these exact scenes via the public API."""
-    fitter = ShapeFitter(DEMO)
-    meta = fitter.meta
-    scenes = scene_set(meta["overfit"], seed=meta["overfit_seed"])
+@pytest.mark.skipif(not WEIGHTS.exists(), reason="trained weights not present")
+def test_shipped_model_generalises():
+    """The shipped checkpoint works on scenes it never saw, through the public API."""
+    fitter = ShapeFitter(WEIGHTS)
+    scenes = scene_set(40, seed=4242)
     ious = [iou(fitter.fit(sc.image), sc.vertices) for sc in scenes]
-    assert np.mean(ious) > 0.95
+    assert np.mean(ious) > 0.93
+
+
+@pytest.mark.skipif(not WEIGHTS.exists(), reason="trained weights not present")
+def test_shipped_model_on_rectangle_unions():
+    fitter = ShapeFitter(WEIGHTS)
+    scenes = scene_set(30, seed=4343, family="rect_union")
+    polys = [fitter.fit(sc.image) for sc in scenes]
+    assert np.mean([iou(p, sc.vertices) for p, sc in zip(polys, scenes)]) > 0.92
+    assert np.mean([len(p) == len(sc.vertices) for p, sc in zip(polys, scenes)]) > 0.4
 
 
 def test_tta_inverts_its_transforms(random_ckpt):

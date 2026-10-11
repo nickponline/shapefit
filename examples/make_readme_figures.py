@@ -1,10 +1,10 @@
 """Regenerate every figure and table in the README.
 
-    python examples/make_readme_figures.py --weights shapefit/weights/overfit_demo.pt
+    python examples/make_readme_figures.py --weights shapefit/weights/shapefit.pt
 
-The demo checkpoint was trained with ``--overfit 48`` (see README): the
-"results" figures show scenes it has memorised, which demonstrates that the
-pipeline works end to end, not that it generalises.
+All results use scenes the model never saw: training draws fresh random
+samples from a different generator stream (seed 0, per worker), and the
+evaluation scenes come from fixed, separate seeds.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from shapefit.data import SIZE, make_sample, render_polygon
 from shapefit.degrade import GEOMETRIC, RASTER, geometric_corrupt, raster_corrupt
 from shapefit.metrics import iou, score, summarize
 from shapefit.scenes import scene_set
-from shapefit.shapes import random_polygon
+from shapefit.shapes import FAMILIES, random_polygon
 
 OUT = Path(__file__).parents[1] / "docs" / "images"
 GREEN, ORANGE, RED, BLUE = "#1a9e5c", "#e8833a", "#d62f3a", "#2f6fd6"
@@ -98,7 +98,7 @@ def fig_corruptions():
 
 def fig_dataset():
     rng = np.random.default_rng(21)
-    samples = [make_sample(rng) for _ in range(8)]
+    samples = [make_sample(rng, family=f) for f in FAMILIES] + [make_sample(rng, family="rect_union")]
     fig, axes = plt.subplots(3, 8, figsize=(16, 6.3))
     for i, s in enumerate(samples):
         show_mask(axes[0, i], s.noisy, s.family)
@@ -136,7 +136,13 @@ def fig_pipeline(fitter, scene):
     plt.close(fig)
 
 
-def fig_results(fitter, scenes, n=12):
+def _is_orthogonal(v):
+    e = np.roll(v, -1, 0) - v
+    e /= np.linalg.norm(e, axis=1, keepdims=True)
+    return np.abs((e * np.roll(e, -1, 0)).sum(1)).max() < 1e-6
+
+
+def fig_results(fitter, scenes, n=12, name="results.png"):
     fig, axes = plt.subplots(2, n // 2, figsize=(n // 2 * 2.9, 6.4))
     for ax, sc in zip(axes.flat, scenes[:n]):
         nn = fitter.fit(sc.image)
@@ -159,13 +165,18 @@ def fig_results(fitter, scenes, n=12):
         fontsize=10,
     )
     fig.tight_layout(rect=(0, 0.05, 1, 1))
-    fig.savefig(OUT / "results.png", dpi=100)
+    fig.savefig(OUT / name, dpi=100)
     plt.close(fig)
 
 
+def fig_unions(fitter, scenes, n=12):
+    """Unions of overlapping rectangles: shapefit vs Douglas-Peucker."""
+    fig_results(fitter, scenes, n=n, name="unions.png")
+
+
 def fig_regularize(fitter, scenes):
-    rect = [s for s in scenes if s.family == "rectilinear"]
-    sc = max(rect, key=lambda s: len(s.vertices))
+    rect = [s for s in scenes if s.family in ("rectilinear", "rect_union") and _is_orthogonal(s.vertices)]
+    sc = sorted(rect, key=lambda s: len(s.vertices))[len(rect) * 3 // 4]
     fig, axes = plt.subplots(1, 3, figsize=(11, 3.9))
     for ax, mode in zip(axes, [None, "orthogonal", "parallel"]):
         v = fitter.fit(sc.image, regularize=mode)
@@ -196,6 +207,22 @@ def table(fitter, scenes):
     return res
 
 
+def family_table(fitter, scenes):
+    lines = [
+        "| family | n | shapefit IoU | shapefit count exact | shapefit F1 | DP 2% IoU | DP 2% count exact | DP 2% F1 |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for fam in sorted({s.family for s in scenes}):
+        sub = [s for s in scenes if s.family == fam]
+        a = summarize([score(fitter.fit(s.image), s.vertices) for s in sub])
+        b = summarize([score(baselines.douglas_peucker(s.image, 0.02), s.vertices) for s in sub])
+        lines.append(
+            f"| `{fam}` | {len(sub)} | {a['iou']:.3f} | {a['count_ok']:.1%} | {a['vertex_f1']:.3f} | "
+            f"{b['iou']:.3f} | {b['count_ok']:.1%} | {b['vertex_f1']:.3f} |"
+        )
+    return "\n".join(lines)
+
+
 def fmt_table(res):
     lines = [
         "| method | IoU ↑ | vertex count exact ↑ | vertex F1 @3% ↑ | vertex err ↓ | Hausdorff ↓ |",
@@ -211,23 +238,26 @@ def fmt_table(res):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--weights", default="shapefit/weights/overfit_demo.pt")
+    ap.add_argument("--weights", default="shapefit/weights/shapefit.pt")
+    ap.add_argument("--device", default="cpu")
     args = ap.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
 
-    fitter = ShapeFitter(args.weights)
-    n, seed = fitter.meta.get("overfit"), fitter.meta.get("overfit_seed")
-    memorised = scene_set(n, seed=seed)
-    unseen = scene_set(200, seed=999)
+    fitter = ShapeFitter(args.weights, device=args.device)
+    unseen = scene_set(500, seed=999)
+    unions = scene_set(200, seed=1000, family="rect_union")
 
     fig_corruptions()
     fig_dataset()
-    fig_pipeline(fitter, memorised[1])
-    fig_results(fitter, memorised)
-    fig_regularize(fitter, memorised)
+    fig_pipeline(fitter, unseen[1])
+    fig_results(fitter, unseen)
+    fig_unions(fitter, unions)
+    fig_regularize(fitter, unions)
 
-    md = ["## memorised scenes (training set of the overfit run)", fmt_table(table(fitter, memorised))]
-    md += ["", "## 200 unseen scenes (overfit model; expected to be poor)", fmt_table(table(fitter, unseen))]
+    md = ["## 500 unseen scenes, all families (scene_set(500, seed=999))", fmt_table(table(fitter, unseen))]
+    md += ["", "## 200 unseen unions of overlapping rectangles (scene_set(200, seed=1000, family='rect_union'))",
+           fmt_table(table(fitter, unions))]
+    md += ["", "## per family, 500 unseen scenes", family_table(fitter, unseen)]
     (OUT.parent / "metrics.md").write_text("\n".join(md) + "\n")
     print("\n".join(md))
 

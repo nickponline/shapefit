@@ -72,3 +72,10 @@ def test_fixed_set_is_deterministic():
     a, b = fixed_set(3, seed=5), fixed_set(3, seed=5)
     for x, y in zip(a, b):
         assert np.array_equal(x.noisy, y.noisy)
+
+
+def test_rect_union_is_a_union_of_overlapping_rectangles():
+    rng = np.random.default_rng(4)
+    counts = [len(random_polygon(rng, "rect_union")[0]) for _ in range(200)]
+    assert min(counts) >= 4 and max(counts) >= 14
+    assert np.mean(counts) > 8  # mostly more complex than a single L or T

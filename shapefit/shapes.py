@@ -9,6 +9,7 @@ no very short edges, so that "the corners" are a well defined target.
 from __future__ import annotations
 
 import numpy as np
+from shapely import affinity
 from shapely.geometry import Polygon, box
 from shapely.ops import unary_union
 
@@ -145,18 +146,45 @@ def rectilinear(rng: np.random.Generator) -> np.ndarray:
     return _rotate(pts, rng.uniform(0, np.pi / 2))
 
 
+def rect_union(rng: np.random.Generator) -> np.ndarray:
+    """Union of 2-6 overlapping rectangles. Each new rectangle is centred inside
+    an earlier one, so the pieces always overlap. 60 % share one orientation
+    (complex rectilinear footprints); the rest have an independent angle each."""
+    k = int(rng.integers(2, 7))
+    aligned = rng.random() < 0.6
+    rects = []
+    for i in range(k):
+        w, h = rng.uniform(0.3, 1.0), rng.uniform(0.15, 0.6)
+        if aligned and rng.random() < 0.5:
+            w, h = h, w
+        r = affinity.rotate(box(-w / 2, -h / 2, w / 2, h / 2), 0.0 if aligned else rng.uniform(0, 180))
+        if rects:
+            base = rects[int(rng.integers(len(rects)))]
+            c = np.asarray(base.centroid.coords[0])
+            q = np.asarray(base.exterior.coords[int(rng.integers(4))])
+            c = c + rng.uniform(0, 0.95) * (q - c)  # a point inside the base rectangle
+            r = affinity.translate(r, *c)
+        rects.append(r)
+    u = unary_union(rects)
+    if u.geom_type != "Polygon" or len(u.interiors):
+        return np.zeros((0, 2))
+    pts = np.asarray(u.exterior.coords)[:-1]
+    return _rotate(pts, rng.uniform(0, np.pi))
+
+
 def _rotate(pts: np.ndarray, theta: float) -> np.ndarray:
     c, s = np.cos(theta), np.sin(theta)
     return pts @ np.array([[c, s], [-s, c]])
 
 
 FAMILIES = {
-    "ngon": (regular_ngon, 0.15),
-    "rectangle": (rectangle, 0.15),
-    "quad": (quad, 0.12),
-    "convex": (random_convex, 0.18),
-    "star": (star_shaped, 0.18),
-    "rectilinear": (rectilinear, 0.22),
+    "ngon": (regular_ngon, 0.12),
+    "rectangle": (rectangle, 0.12),
+    "quad": (quad, 0.10),
+    "convex": (random_convex, 0.14),
+    "star": (star_shaped, 0.14),
+    "rectilinear": (rectilinear, 0.16),
+    "rect_union": (rect_union, 0.22),
 }
 
 

@@ -7,7 +7,7 @@ Each shard ``shard_XXXXX.npz`` holds:
 
 * ``noisy``    (n, S*S/8) uint8  - bit-packed corrupted input masks
 * ``mask``     (n, S*S/8) uint8  - bit-packed clean target masks
-* ``vertices`` (n, 16, 2) float32 - clean polygon vertices (canvas pixels), NaN padded
+* ``vertices`` (n, 32, 2) float32 - clean polygon vertices (canvas pixels), NaN padded
 * ``nvert``    (n,) int16
 * ``family``   (n,) <U12
 
@@ -29,7 +29,7 @@ from torch.utils.data import Dataset
 
 from .data import SIZE, Sample, make_sample, vertex_heatmap
 
-MAX_VERTS = 16
+MAX_VERTS = 32
 
 
 def _pack(m: np.ndarray) -> np.ndarray:

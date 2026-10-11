@@ -54,3 +54,12 @@ def test_baselines_run():
     s = fixed_set(1, seed=15)[0]
     for f in (baselines.douglas_peucker, baselines.convex_hull, baselines.min_area_rect):
         assert len(f(s.noisy)) >= 3
+
+
+def test_oracle_on_rectangle_unions():
+    """Unions of many overlapping rectangles have many corners; the vectorizer must keep them all."""
+    samples = fixed_set(80, seed=16, family="rect_union")
+    assert max(len(s.vertices) for s in samples) >= 12
+    m = summarize([score(_oracle(s), s.vertices) for s in samples])
+    assert m["iou"] > 0.98
+    assert m["count_ok"] > 0.9

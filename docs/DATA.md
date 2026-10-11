@@ -12,12 +12,13 @@ regulariser for this kind of task.
 
 | family | weight | what it is |
 |---|---|---|
-| `ngon` | 0.15 | regular 3–8-gons, mildly stretched |
-| `rectangle` | 0.15 | rotated, aspect ratio 1–4 |
-| `quad` | 0.12 | trapezoids, parallelograms, kites |
-| `convex` | 0.18 | convex hull of random points (5–11 vertices) |
-| `star` | 0.18 | concave star-shaped polygons (5–12 vertices) |
-| `rectilinear` | 0.22 | building-like L/T/U/+ unions of 2–4 rectangles, rotated |
+| `ngon` | 0.12 | regular 3–8-gons, mildly stretched |
+| `rectangle` | 0.12 | rotated, aspect ratio 1–4 |
+| `quad` | 0.10 | trapezoids, parallelograms, kites |
+| `convex` | 0.14 | convex hull of random points (5–11 vertices) |
+| `star` | 0.14 | concave star-shaped polygons (5–12 vertices) |
+| `rectilinear` | 0.16 | building-like L/T/U/+ unions of 2–4 axis-aligned rectangles, rotated |
+| `rect_union` | 0.22 | union of 2–6 overlapping rectangles (4–21 vertices, mean ≈ 10); 60 % share one orientation, 40 % have an independent angle each |
 
 All polygons are randomly reflected and pass `is_good()`, so the target is
 well defined:
@@ -93,8 +94,8 @@ input is the mask plus two CoordConv channels. The output is two logit maps:
 ## 6. Running the full training
 
 ```bash
-# on-the-fly stream, 8 CPU workers feeding the GPU (recommended)
-python -m shapefit.train --steps 30000 --batch 64 --lr 2e-3 --out runs/base
+# on-the-fly stream feeding the GPU (recommended; this made the shipped checkpoint)
+python -m shapefit.train --steps 120000 --batch 64 --workers 28 --eval-every 5000 --out runs/full
 
 # or materialise a fixed dataset first (≈400 B/sample bit-packed: 200k ≈ 80 MB)
 python -m shapefit.make_dataset --n 200000 --out data/train --seed 0
@@ -103,20 +104,23 @@ python -m shapefit.train --data data/train --steps 30000 --out runs/shards
 ```
 
 * AdamW, 500-step warm-up, then cosine decay; gradients clipped to norm 1.
+* On CUDA the step runs under bf16 autocast and `torch.compile` (turn them off
+  with `--no-amp` / `--no-compile`). Together they make a step about 1.7× faster.
 * Every `--eval-every` steps, the run vectorises a fixed set of 500 validation
   samples (seed 10000) and logs IoU, vertex-count accuracy, vertex F1, vertex
-  error and Hausdorff distance to `log.jsonl`. It keeps `best.pt` (by IoU + count
-  accuracy) and `last.pt`.
-* Throughput: about 0.4 s/step at batch 64 on an M3 Max (MPS), so 30k steps
-  take about 3.5 h. A recent CUDA GPU is roughly 5–10× faster. Data loading
-  isn't the bottleneck: 8 workers produce a batch in about 15 ms.
+  error and Hausdorff distance to `log.jsonl`. It also scores 200 `rect_union`
+  samples (seed 10001) and logs them with a `union_` prefix. It keeps `best.pt`
+  (by IoU + count accuracy on the main set) and `last.pt`.
+* Throughput on one RTX 4090: about 30 ms/step at batch 64 (bf16 + compile),
+  so the shipped 120k-step run took 74 min including its 24 checks. 28 data
+  workers produce a batch in about 14 ms, so the GPU sets the speed.
 * Copy the result to `shapefit/weights/shapefit.pt` so that `fit_polygon()`
   without arguments picks it up.
 
 ### Shard format (`make_dataset`)
 
 `shard_XXXXX.npz` holds `noisy`, `mask` (bit-packed `(n, 2048)` uint8),
-`vertices` (`(n, 16, 2)` float32, padded with NaN), `nvert`, `family` and
+`vertices` (`(n, 32, 2)` float32, padded with NaN), `nvert`, `family` and
 `size`. Heatmaps are re-rendered from the vertices when a sample is loaded.
 `ShardDataset` reads the shards and is a drop-in replacement for the stream.
 
@@ -129,5 +133,4 @@ python -m shapefit.train --overfit 48 --batch 32 --steps 2500 --eval-every 500 -
 This trains and evaluates on the same 48 full-resolution scenes
 (`scene_set(48, seed=7)`). The scenes go through the same `frame_mask` path as
 inference. If this doesn't reach the vectoriser's oracle ceiling (IoU ≈ 0.994),
-something is wrong in the data, the targets or the vectoriser. It's also how
-the README's demo checkpoint was produced.
+something is wrong in the data, the targets or the vectoriser.

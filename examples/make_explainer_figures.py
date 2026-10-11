@@ -158,10 +158,23 @@ def heatmap_target():
 
 
 def main():
-    fitter = ShapeFitter("shapefit/weights/overfit_demo.pt")
-    scenes = scene_set(48, seed=7)
-    vectorizer_steps(fitter, scenes[0])
-    dp_failure(fitter, scenes[6])
+    fitter = ShapeFitter("shapefit/weights/shapefit.pt")
+    scenes = scene_set(500, seed=999)  # unseen during training, same set as the README tables
+
+    # illustrative picks, by a fixed rule: shapefit gets every corner, and the shape
+    # shows the point of the figure. The README tables give the averages.
+    def clean_fit(s, min_iou):
+        v = fitter.fit(s.image)
+        return len(v) == len(s.vertices) and iou(v, s.vertices) > min_iou
+
+    star = next(s for s in scenes if s.family == "star" and len(s.vertices) >= 7 and clean_fit(s, 0.97))
+    dp = next(
+        s for s in scenes
+        if s.family in ("quad", "ngon") and 0.9 < s.severity and clean_fit(s, 0.975)
+        and len(baselines.douglas_peucker(s.image, 0.02)) != len(s.vertices)
+    )
+    vectorizer_steps(fitter, star)
+    dp_failure(fitter, dp)
     heatmap_target()
 
 

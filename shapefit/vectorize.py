@@ -105,6 +105,43 @@ def regularize_directions(lines: list, mode: str, tol_deg: float | None = None) 
     raise ValueError(f"unknown regularize mode {mode!r}")
 
 
+def _seg_dist(pts: np.ndarray, p: np.ndarray, q: np.ndarray) -> np.ndarray:
+    """Distance from each point to the segment ``p``-``q``."""
+    d = q - p
+    t = np.clip(((pts - p) @ d) / max(float(d @ d), 1e-12), 0, 1)
+    return np.linalg.norm(pts - (p + t[:, None] * d), axis=1)
+
+
+def split_missed_corners(contour: np.ndarray, idx: np.ndarray, tol: float, max_iter: int = 64) -> np.ndarray:
+    """Add corners the heatmap missed.
+
+    Wherever the contour between two consecutive corners strays more than ``tol``
+    pixels from the straight chord joining them, the farthest contour point
+    becomes a new corner (one Douglas-Peucker split, seeded by the network's
+    corners). Returns sorted contour indices.
+    """
+    L = len(contour)
+    idx = sorted(int(i) for i in idx)
+    for _ in range(max_iter):
+        new = []
+        for k in range(len(idx)):
+            a, b = idx[k], idx[(k + 1) % len(idx)]
+            seg = np.arange(a, b if b > a else b + L) % L
+            if len(idx) == 1:
+                seg = np.arange(a, a + L) % L
+            if len(seg) < 3:
+                continue
+            q = contour[b] if len(idx) > 1 else contour[seg[len(seg) // 2]]
+            dist = _seg_dist(contour[seg], contour[a], q)
+            j = int(np.argmax(dist))
+            if dist[j] > tol:
+                new.append(int(seg[j]))
+        if not new:
+            break
+        idx = sorted(set(idx) | set(new))
+    return np.asarray(idx)
+
+
 def polygon_from_outputs(
     mask_logits: np.ndarray,
     heat_logits: np.ndarray,
@@ -112,8 +149,14 @@ def polygon_from_outputs(
     upsample: int = 4,
     regularize: str | None = None,
     min_turn_deg: float = 8.0,
+    split_tol: float | None = 3.0,
 ) -> np.ndarray:
-    """Build a polygon (canvas pixel coordinates, (N, 2)) from raw logits ``(S, S)``."""
+    """Build a polygon (canvas pixel coordinates, (N, 2)) from raw logits ``(S, S)``.
+
+    ``split_tol`` (canvas pixels): add a corner wherever the predicted outline
+    strays further than this from the edge between two detected corners. This
+    recovers corners whose heatmap peak was too weak. ``None`` disables it.
+    """
     S = mask_logits.shape[0]
     big = cv2.resize(mask_logits.astype(np.float32), (S * upsample, S * upsample), interpolation=cv2.INTER_LINEAR)
     contour = _largest_contour(big > 0)
@@ -149,6 +192,10 @@ def polygon_from_outputs(
             keep = keep[1:] if scores[keep[0]] < scores[keep[-1]] else keep[:-1]
         peaks, scores, idx = peaks[keep], scores[keep], np.asarray(idx)[keep]
 
+    if split_tol and len(idx) >= 1:
+        found = {int(i): p for i, p in zip(idx, peaks)}
+        idx = split_missed_corners(contour, idx, split_tol)
+        peaks = np.array([found.get(int(i), contour[int(i)]) for i in idx]).reshape(-1, 2)
     if len(idx) < 3:  # network found no usable corners: fall back to Douglas-Peucker
         approx = cv2.approxPolyDP(contour.astype(np.float32).reshape(-1, 1, 2), 1.5, True)[:, 0]
         return _orient(clean_vertices(approx.astype(np.float64), min_turn_deg))
